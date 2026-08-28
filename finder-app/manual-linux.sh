@@ -1,6 +1,4 @@
 #!/bin/bash
-# Script outline to install and build kernel.
-# Author: Siddhant Jajoo.
 
 set -e
 set -u
@@ -15,66 +13,128 @@ CROSS_COMPILE=aarch64-none-linux-gnu-
 
 if [ $# -lt 1 ]
 then
-	echo "Using default directory ${OUTDIR} for output"
+    echo "Using default directory ${OUTDIR} for output"
 else
-	OUTDIR=$1
-	echo "Using passed directory ${OUTDIR} for output"
+    OUTDIR=$1
+    echo "Using passed directory ${OUTDIR} for output"
 fi
 
-mkdir -p ${OUTDIR}
+mkdir -p "${OUTDIR}"
 
-cd "$OUTDIR"
-if [ ! -d "${OUTDIR}/linux-stable" ]; then
-    #Clone only if the repository does not exist.
-	echo "CLONING GIT LINUX STABLE VERSION ${KERNEL_VERSION} IN ${OUTDIR}"
-	git clone ${KERNEL_REPO} --depth 1 --single-branch --branch ${KERNEL_VERSION}
-fi
-if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
-    cd linux-stable
-    echo "Checking out version ${KERNEL_VERSION}"
-    git checkout ${KERNEL_VERSION}
+# Build Linux kernel
+cd "${OUTDIR}"
 
-    # TODO: Add your kernel build steps here
+if [ ! -d "${OUTDIR}/linux-stable" ]
+then
+    echo "Cloning Linux kernel ${KERNEL_VERSION}"
+    git clone ${KERNEL_REPO} --depth 1 --single-branch --branch ${KERNEL_VERSION} linux-stable
 fi
 
-echo "Adding the Image in outdir"
+cd "${OUTDIR}/linux-stable"
 
-echo "Creating the staging directory for the root filesystem"
-cd "$OUTDIR"
+git checkout ${KERNEL_VERSION}
+
+if [ ! -e "${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image" ]
+then
+    echo "Building Linux kernel"
+
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} Image
+fi
+
+cp "${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image" "${OUTDIR}/Image"
+
+# Create root filesystem
+cd "${OUTDIR}"
+
 if [ -d "${OUTDIR}/rootfs" ]
 then
-	echo "Deleting rootfs directory at ${OUTDIR}/rootfs and starting over"
-    sudo rm  -rf ${OUTDIR}/rootfs
+    echo "Deleting old rootfs"
+    sudo rm -rf "${OUTDIR}/rootfs"
 fi
 
-# TODO: Create necessary base directories
+mkdir -p "${OUTDIR}/rootfs"
+mkdir -p "${OUTDIR}/rootfs"/{bin,sbin,etc,proc,sys,dev,tmp,home,var,usr/bin,usr/sbin}
 
-cd "$OUTDIR"
+# Build BusyBox
 if [ ! -d "${OUTDIR}/busybox" ]
 then
-git clone git://busybox.net/busybox.git
-    cd busybox
-    git checkout ${BUSYBOX_VERSION}
-    # TODO:  Configure busybox
-else
-    cd busybox
+    git clone git://busybox.net/busybox.git
 fi
 
-# TODO: Make and install busybox
+cd "${OUTDIR}/busybox"
+git checkout ${BUSYBOX_VERSION}
 
-echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+make distclean
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
 
-# TODO: Add library dependencies to rootfs
+# Static BusyBox is easier for initramfs
+sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 
-# TODO: Make device nodes
+make -j$(nproc) ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE}
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} CONFIG_PREFIX="${OUTDIR}/rootfs" install
 
-# TODO: Clean and build the writer utility
+# Create init script
+cat > "${OUTDIR}/rootfs/init" << 'EOF'
+#!/bin/sh
 
-# TODO: Copy the finder related scripts and executables to the /home directory
-# on the target rootfs
+mount -t proc none /proc
+mount -t sysfs none /sys
+mount -t devtmpfs none /dev
 
-# TODO: Chown the root directory
+echo
+echo "Welcome to AELD Linux"
+echo
 
-# TODO: Create initramfs.cpio.gz
+exec /bin/sh
+EOF
+
+chmod +x "${OUTDIR}/rootfs/init"
+
+# Build writer for ARM64
+cd "${FINDER_APP_DIR}"
+
+make clean
+make CROSS_COMPILE=${CROSS_COMPILE} LDFLAGS="-static"
+
+cp writer "${OUTDIR}/rootfs/home/writer"
+# Copy finder application files
+cp finder.sh "${OUTDIR}/rootfs/home/"
+cp finder-test.sh "${OUTDIR}/rootfs/home/"
+cp autorun-qemu.sh "${OUTDIR}/rootfs/home/"
+
+mkdir -p "${OUTDIR}/rootfs/home/conf"
+
+cp ../conf/username.txt "${OUTDIR}/rootfs/home/conf/"
+cp ../conf/assignment.txt "${OUTDIR}/rootfs/home/conf/"
+
+# Fix paths for target filesystem
+sed -i 's#../conf/username.txt#conf/username.txt#' \
+    "${OUTDIR}/rootfs/home/finder-test.sh"
+
+sed -i 's#../conf/assignment.txt#conf/assignment.txt#' \
+    "${OUTDIR}/rootfs/home/finder-test.sh"
+
+# Make scripts executable
+chmod +x "${OUTDIR}/rootfs/home/"*.sh
+chmod +x "${OUTDIR}/rootfs/home/writer"
+
+# Create device nodes
+sudo mknod -m 666 "${OUTDIR}/rootfs/dev/null" c 1 3 || true
+sudo mknod -m 666 "${OUTDIR}/rootfs/dev/console" c 5 1 || true
+
+# Set ownership
+sudo chown -R root:root "${OUTDIR}/rootfs"
+
+# Create initramfs
+cd "${OUTDIR}/rootfs"
+
+sudo find . -print0 | sudo cpio --null -ov --format=newc | gzip -9 > "${OUTDIR}/initramfs.cpio.gz"
+
+echo
+echo "========================================"
+echo "Assignment 3 Part 2 build complete"
+echo "Kernel:    ${OUTDIR}/Image"
+echo "Initramfs: ${OUTDIR}/initramfs.cpio.gz"
+echo "========================================"
+
